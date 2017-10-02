@@ -1,6 +1,6 @@
-[submodule "exploit-database"]
-	path = elem/exploit-database
+[submodule "data/exploits/exploit-database"]
+	path = data/exploits/exploit-database
 	url = https://github.com/offensive-security/exploit-database.git
-[submodule "elem/elem-curation"]
-	path = elem/elem-curation
-	url = https://github.com/fedoraredteam/elem-curation.git
+[submodule "data/curation"]
+	path = data/curation
+	url = git@github.com:fedoraredteam/elem-curation.git

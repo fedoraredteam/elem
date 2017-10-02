@@ -1,300 +1,348 @@
-#!/usr/bin/python
-
-from exploit_database import ExploitDatabase
-from curation_manager import ExploitManager
-from cve_manager import SecurityAPI
-
+import ConfigParser
+import argparse
+from resource import ResourceManager
+from resource import ExploitManager
+from resource import CurationManager
+from resource import SecurityApi
+from resource import AssessmentManager
+from resource import MANAGER_GIT
+from resource import MANAGER_URL
+import logging
 import sys
-import subprocess
-import re
-import log
-import shutil
+from os.path import expanduser
 import os
+import shutil
 
+DEFAULT_CONFIG_FILE='./config/elem.conf'
 
 class Elem(object):
-    def __init__(self, args):
-        self.args = args
-        self.logger = log.setup_custom_logger('elem')
-        self.console_logger = log.setup_console_logger('console')
+    def __init__(self, cli_args=None, config=None):
+        self.cli_args = cli_args
+        self.config = config
+        self.security_apis = dict()
+        self.curation_manager = None
+        self.exploit_managers = dict()
+        self.tlsverify = not cli_args.notlsverify
+        self.console_logger = logging.getLogger('console')
+        
+        for section in config.sections():
+            if section.startswith('security-api'):
+                name = section.split(':')[1]
+                security_api = SecurityApi(name, 
+                                    self.config.get(section, 'url'), 
+                                    self.config.get(section, 'location'), 
+                                    self.tlsverify)
+                self.security_apis[name] = security_api
 
-        self.exploitdb = ExploitDatabase(self.args.exploitdb,
-                                         self.args.exploitdbrepo)
-        self.exploit_manager = ExploitManager(self.args.exploits,
-                                              self.args.exploitsrepo)
+            elif section.startswith('curation-data') and not self.curation_manager:
+                name = section.split(':')[1]
+                if self.config.has_option(section, 'git'):
+                    curation_manager = CurationManager(name,  
+                                                 self.config.get(section, 'git'), 
+                                                 self.config.get(section, 'location'),
+                                                 file_listing=self.config.get(section, 'file_listing'), 
+                                                 config_option='git',
+                                                 tlsverify=self.tlsverify)
+                elif self.config.has_option(section, 'url'):
+                     curation_manager = CurationManager(name,  
+                                                 self.config.get(section, 'url'), 
+                                                 self.config.get(section, 'location'), 
+                                                 file_listing=self.config.get(section, 'file_listing'),
+                                                 config_option='url',
+                                                 tlsverify=self.tlsverify)
 
-    def run(self):
+                self.curation_manager = curation_manager
 
-        if hasattr(self.args, 'cpe') and 'Not Defined' in self.args.cpe:
-            self.console_logger.error("CPE is required but not defined.")
+            elif section.startswith('exploits-source'):
+                name = section.split(':')[1]
+                
+                if self.config.has_option(section, 'git'):
+                    exploit_manager = ExploitManager(name,  
+                                                 self.config.get(section, 'git'), 
+                                                 self.config.get(section, 'location'),
+                                                 file_listing=self.config.get(section, 'file_listing'), 
+                                                 config_option='git',
+                                                 tlsverify=self.tlsverify)
+                elif self.config.has_option(section, 'url'):
+                     exploit_manager = ExploitManager(name,  
+                                                 self.config.get(section, 'url'), 
+                                                 self.config.get(section, 'location'), 
+                                                 file_listing=self.config.get(section, 'file_listing'),
+                                                 config_option='url',
+                                                 tlsverify=self.tlsverify)
 
-        if hasattr(self.args, 'refresh'):
-            self.refresh(self.args.securityapi, self.args.sslverify)
-        elif hasattr(self.args, 'list'):
-            self.list_exploits(self.args.edbid,
-                               self.args.cveid)
-        elif hasattr(self.args, 'score'):
-            self.score_exploit(self.args.edbid,
-                               self.args.cpe,
-                               self.args.kind,
-                               self.args.value)
-        elif hasattr(self.args, 'assess'):
-            self.assess()
-        elif hasattr(self.args, 'copy'):
-            self.copy(self.args.edbid, self.args.destination, self.args.stage, self.args.cpe)
-        elif hasattr(self.args, 'patch'):
-            self.patch(self.args.edbid)
-        elif hasattr(self.args, 'setstage'):
-            self.set_stage_info(self.args.edbid,
-                                self.args.cpe,
-                                self.args.command,
-                                self.args.packages,
-                                self.args.services,
-                                self.args.selinux)
+                self.exploit_managers[name] = exploit_manager
 
-    def refresh(self,
-                security_api_url,
-                sslverify):
-        self.console_logger.info("Refresh ExploitDB Repository")
-        self.exploitdb.refresh_repository()
-        self.console_logger.info("Finished Refreshing ExploitDB Repository")
-        self.console_logger.info("Searching for CVE Information" +
-                                 " in Known Exploits")
-        self.exploitdb.refresh_exploits_with_cves()
-        self.console_logger.info("Finished Searching for CVE Information" +
-                                 " in Known Exploits")
-        self.console_logger.info("Refreshing Exploits Repository")
-        self.exploit_manager.refresh_repository()
-        self.console_logger.info("Finished Refreshing Exploits Repository")
-        self.exploit_manager.load_exploit_info()
-        self.console_logger.info("Reconcile Existing Data with Data "
-                                 "from ExploitDB")
-        # We will reconcile information from the exploit database with the
-        # existing exploit data.
-        for edbid in self.exploitdb.exploits.keys():
-            # Add an exploit if it doesn't exist
-            if edbid not in self.exploit_manager.exploits.keys():
-                self.exploit_manager.exploits[edbid] = dict(filename='',
-                                                            cves=dict())
-                self.exploit_manager.write(edbid)
+    def refresh(self):
+        if self.curation_manager.kind() == MANAGER_GIT:
+            self.curation_manager.get_data()
+            self.curation_manager.load_data()
 
-            # Update the file name if necessary
-            if self.exploit_manager.exploits[edbid]['filename'] != \
-                    self.exploitdb.exploits[edbid]['filename']:
-                self.exploit_manager.exploits[edbid]['filename'] = \
-                    self.exploitdb.exploits[edbid]['filename']
-                self.exploit_manager.write(edbid)
+        for manager in self.exploit_managers.keys():
+            if self.exploit_managers[manager].kind() == MANAGER_GIT:
+                self.exploit_managers[manager].get_data()
+                self.exploit_managers[manager].load_data()
+                if self.curation_manager.kind() == MANAGER_GIT:
+                    for eid in self.exploit_managers[manager].data.keys():
+                        if eid not in self.curation_manager.data.keys():
+                            self.curation_manager.data[eid] = \
+                                self.exploit_managers[manager].data[eid]
 
+                        for cveid in self.exploit_managers[manager].data[eid]['cves']:
+                            if cveid not in self.curation_manager.data[eid]['cves']:
+                                self.curation_manager.data[eid]['cves'].append(cveid)
+                        self.curation_manager.save_data(eid)
+                self.console_logger.info("Total Listing: " + str(self.exploit_managers[manager].total_listing()))
+                self.console_logger.info("Potentially Relevant Listing: " + str(self.exploit_managers[manager].total_relevant()))
+                self.console_logger.info("Potentially Relevant with CVEs: " + str(self.exploit_managers[manager].total_with_cves()))
 
-            # Ensure that all CVE's detected from exploit-db are present in
-            # curation information.
-            for cveid in self.exploitdb.exploits[edbid]['cves']:
-                if cveid not in \
-                        self.exploit_manager.exploits[edbid]['cves'].keys():
-                    self.exploit_manager.exploits[edbid]['cves'][cveid] = \
-                        dict()
-                    self.exploit_manager.write(edbid)
-        self.console_logger.info("Finished Reconciling Existing Data With "
-                                 "Data from ExploitDB")
-        # Next, query the security API
-        self.console_logger.info("Refresh Data from SecurityAPI")
-        securityapi = SecurityAPI(security_api_url, sslverify)
-        securityapi.refresh()
+    def show(self, eids=[], cves=[]):
+        self.curation_manager.get_data()
+        self.curation_manager.load_data()
+        lines = []
+        if len(eids) > 0:
+            filtered_data = self.curation_manager.exploits_by_ids(eids)
+            lines += self.curation_manager.list_data(filtered_data)
+        if len(cves) > 0:
+            filtered_data = self.curation_manager.exploits_by_cves(cves)
+            lines += self.curation_manager.list_data(filtered_data)
+        if len(eids) == 0 and len(cves) == 0:
+            lines = self.curation_manager.list_data()
 
-        # Indicate whether a CVE was found in the security API or not
-        for cve in securityapi.cve_list:
-            for edbid in self.exploit_manager.exploits.keys():
-                if cve in self.exploit_manager.exploits[edbid]['cves'].keys():
-                    self.exploit_manager.exploits[edbid]['cves'][cve]['rhapi'] = True
-                    self.exploit_manager.write(edbid)
-        self.console_logger.info("Finished Refreshing Data from SecurityAPI")
-
-    def list_exploits(self, edbids_to_find=[], cveids_to_find=[]):
-        results = []
-        try:
-            self.exploit_manager.load_exploit_info()
-        except OSError:
-            self.console_logger.error("\nNo exploit information loaded.  "
-                                      "Please try: elem refresh\n")
-            sys.exit(1)
-
-        for edbid_to_find in edbids_to_find:
-            if self.exploit_manager.affects_el(edbid_to_find):
-                results += self.exploit_manager.get_exploit_strings(edbid_to_find)
-            else:
-                self.console_logger.warn("Exploit ID %s does not appear "
-                                         "to affect enterprise Linux." %
-                                         edbid_to_find)
-                sys.exit(0)
-
-        for cveid_to_find in cveids_to_find:
-            exploit_ids = self.exploit_manager.exploits_by_cve(cveid_to_find)
-            for edbid in exploit_ids:
-                results += self.exploit_manager.get_exploit_strings(edbid)
-            if len(exploit_ids) == 0:
-                self.console_logger.warn("There do not appear to be any "
-                                         "exploits that affect CVE %s."
-                                         % cveid_to_find)
-
-        if not edbids_to_find and not cveids_to_find:
-            for edbid in self.exploit_manager.exploits.keys():
-                if self.exploit_manager.affects_el(edbid):
-                    results += self.exploit_manager.get_exploit_strings(edbid)
-
-        for line in results:
+        for line in lines:
             self.console_logger.info(line)
 
-        if len(results) == 0:
-            self.console_logger.warn("There do not appear to be any "
-                                     "exploit information available.  Please"
-                                     " try: elem refresh")
-
-    def score_exploit(self,
-                      edbid,
-                      cpe,
-                      score_kind,
-                      score):
+    def score(self,
+              edbid,
+              cpe,
+              score_kind,
+              score):
         try:
-            self.exploit_manager.load_exploit_info()
+            if self.curation_manager.kind() == MANAGER_GIT:
+                self.curation_manager.get_data()
+                self.curation_manager.load_data()
+            else:
+                self.console_logger.error("\nIn order to score exploits, the curation manager must be configured as a Git repo.  Please reconfigure the curation manager and run: elem refresh\n")
+                sys.exit(1)
         except OSError:
             self.console_logger.error("\nNo exploit information loaded.  "
                                       "Please try: elem refresh\n")
             sys.exit(1)
-        self.exploit_manager.score(edbid, cpe, score_kind, score)
-        self.exploit_manager.write(edbid)
+        if 'Not Detected' in cpe:
+            self.console_logger.error("\nThe CPE was neither detected nor provided.  Please provide a CPE with the --cpe option.\n")
+            sys.exit(1)
 
+        self.curation_manager.score(edbid, cpe, score_kind, score)
+        self.curation_manager.save_data(edbid)
+
+    def stage(self, eid, cpe, command, selinux, packages, services):
+        try:
+            if self.curation_manager.kind() == MANAGER_GIT:
+                self.curation_manager.get_data()
+                self.curation_manager.load_data()
+            else:
+                self.console_logger.error("\nIn order to set staging information for exploits, the curation manager must be configured as a Git repo.  Please reconfigure the curation manager and run: elem refresh\n")
+                sys.exit(1)
+        except OSError:
+            self.console_logger.error("\nNo exploit information loaded.  "
+                                      "Please try: elem refresh\n")
+            sys.exit(1)
+        if 'Not Detected' in cpe:
+            self.console_logger.error("\nThe CPE was neither detected nor provided.  Please provide a CPE with the --cpe option.\n")
+            sys.exit(1)
+        
+
+        if len(command) > 0:
+            self.curation_manager.set_staging(eid, cpe, command)
+        if selinux is not None:
+            self.curation_manager.set_selinux(eid, cpe, selinux)
+        if len(packages) > 0:
+            self.curation_manager.set_packages(eid, cpe, packages)
+        if len(services) > 0:
+            self.curation_manager.set_services(eid, cpe, services)
+        self.curation_manager.save_data(eid)
+        
+    
     def assess(self):
-        assessed_cves = []
+        self.curation_manager.get_data()
+        self.curation_manager.load_data()
+
+        assessment_manager = AssessmentManager()
+        assessment_manager.assess()
+
+        exploits = []
         lines = []
-        error_lines = []
+        filtered_data = self.curation_manager.exploits_by_cves(assessment_manager.assessed_cves)
+        lines += self.curation_manager.list_data(filtered_data)
 
-        try:
-            self.exploit_manager.load_exploit_info()
-        except OSError:
-            self.console_logger.error("\nNo exploit information loaded.  "
-                                      "Please try: elem refresh\n")
-            sys.exit(1)
-
-        try:
-            command = ["yum", "updateinfo", "list", "cves"]
-            p = subprocess.Popen(command,
-                                 stdout=subprocess.PIPE,
-                                 stderr=subprocess.PIPE)
-            out, err = p.communicate()
-            lines = out.split('\n')
-            error_lines = err.split('\n')
-        except OSError:
-            self.logger.error("\'assess\' may only be "
-                              "run on an Enterprise Linux host.")
-            sys.exit(1)
-        pattern = re.compile('\s(.*CVE-\d{4}-\d{4,})')
         for line in lines:
-            result = re.findall(pattern, line)
-            if result and result[0] not in assessed_cves:
-                assessed_cves.append(result[0])
+            self.console_logger.info(line)
 
-        assessed_cves = list(set(assessed_cves))
 
-        for cveid in assessed_cves:
-            edbids = self.exploit_manager.exploits_by_cve(cveid)
-            for edbid in edbids:
-                strings = self.exploit_manager.get_exploit_strings(edbid)
-                for string in strings:
-                    self.console_logger.info(string)
+    def copy(self, source, eids, destination, stage=False, cpe=''):
 
-    def copy(self, edbids, destination, stage=False, cpe=''):
-        dirname = os.path.dirname(os.path.realpath(__file__))
-
-        try:
-            self.exploit_manager.load_exploit_info()
-        except OSError:
-            self.console_logger.error("\nNo exploit information loaded.  "
-                                      "Please try: elem refresh\n")
+        if 'Not Detected' in cpe:
+            self.console_logger.error("\nThe CPE was neither detected nor provided.  Please provide a CPE with the --cpe option.\n")
             sys.exit(1)
+        self.curation_manager.load_data()
 
-        for edbid in edbids:
-            self.console_logger.info("Copying from %s to %s." %
-                            (self.exploit_manager.exploits[edbid]['filename'],
-                             destination))
-            fullpath = os.path.join(self.exploitdb.content_path,
-                                    self.exploit_manager.exploits[edbid]['filename'])
+        for eid in eids:
+            fullpath = os.path.join(self.exploit_managers[source].manager_path,
+                                    self.exploit_managers[source].file_listing.listing[eid]['file'])
+            self.console_logger.info("Copying from %s to %s." % (fullpath, destination))
             shutil.copy(fullpath, destination)
             if stage and cpe is not '':
-                success, msg = self.exploit_manager.stage(edbid,
-                                                          destination,
-                                                          cpe)
+                success, msg = self.curation_manager.stage(eid,
+                                                           destination,
+                                                           cpe)
                 if success:
                     self.console_logger.info("Successfuly staged exploit %s" %
-                                             (edbid))
+                                             (eid))
                 else:
                     self.console_logger.info("Unsuccessfuly staged exploit " +
                                              "%s with error message %s." %
-                                             (edbid, str(msg)))
+                                             (eid, str(msg)))
             elif stage and cpe is '':
                 self.console_logger.warn("CPE is undefined so unable to "
-                                         "stage %s" % edbid)
+                                         "stage %s" % eid)
+            
 
-    def patch(self, edbid):
+
+class ConfigurationHandler(object):
+    def __init__(self, config_file=''):
+        if config_file is not '':
+            self.config_file = DEFAULT_CONFIG_FILE
+
+    def read_config(self):
+        config = ConfigParser.ConfigParser()
+        config.readfp(open(self.config_file))
+        return config
+
+
+class CliHandler(object):
+    def __init__(self):
+
+        self.parser = argparse.ArgumentParser(description='Cross Reference CVE\'s ' +
+                                              'against a Exploit-DB entries for ' +
+                                              'Enterprise Linux.')
+
+        self.parser.add_argument('--notlsverify',
+                                 action='store_true',
+                                 help='Do not use TLS when querying Security API\'s')
+
+        self.parser.add_argument('--config',
+                                 required=False,
+                                 default=DEFAULT_CONFIG_FILE,
+                                 help='Configuration file to use')
+
+        subparsers = self.parser.add_subparsers()
+        refresh_parser = subparsers.add_parser('refresh')
+        refresh_parser.set_defaults(which='refresh')
+
+        list_parser = subparsers.add_parser('list')
+        list_parser.set_defaults(which='list')
+        list_parser.add_argument('--eids',
+                                 help="The exploit ID's on which to filter.",
+                                 required=False,
+                                 nargs='*',
+                                 default=[],
+                                 type=str)
+        list_parser.add_argument('--cveids',
+                                 help="The CVE ID(s) on which to filter.",
+                                 required=False,
+                                 nargs='*',
+                                 default=[],
+                                 type=str)
+
+        score_parser = subparsers.add_parser('score')
+        score_parser.set_defaults(which='score')
+        score_parser.add_argument('--eid',
+                                help='Which exploit to score',
+                                required=True,
+                                type=str)
+        score_parser.add_argument('--cpe',
+                                required=False,
+                                default=self.read_cpe(),
+                                type=str)
+        score_parser.add_argument('--kind',
+                                required=False,
+                                default='stride',
+                                choices=['stride'],
+                                help='Threat Score Kind',
+                                type=str)
+        score_parser.add_argument('--value',
+                                required=True,
+                                help='Threat Score',
+                                type=str)
+
+        staging_parser = subparsers.add_parser('stage')
+        staging_parser.set_defaults(which='stage')
+        staging_parser.add_argument('--eid',
+                                    help='Which exploit on which to set staging information.',
+                                    required=True,
+                                    type=str)
+        staging_parser.add_argument('--cpe',
+                                    required=False,
+                                    default=self.read_cpe(),
+                                    type=str)
+        staging_parser.add_argument('--packages',
+                                    help="The packages needed to support this exploit",
+                                    required=False,
+                                    nargs='*',
+                                    default=[],
+                                    type=str)
+        staging_parser.add_argument('--services',
+                                    help="The services needed to support this exploit",
+                                    required=False,
+                                    nargs='*',
+                                    default=[],
+                                    type=str)
+        staging_parser.add_argument('--selinux',
+                                    required=False,
+                                    choices=['enforcing', 'permissive'],
+                                    help='SELinux state for this exploit to work.',
+                                    type=str)
+        staging_parser.add_argument('--command',
+                                    help="The command used to stage the exploit",
+                                    required=False,
+                                    nargs=argparse.REMAINDER,
+                                    type=str)
+
+        copy_parser = subparsers.add_parser('copy')
+        copy_parser.set_defaults(which='copy')
+        copy_parser.add_argument('--destination',
+                                required=False,
+                                default=expanduser("~"),
+                                type=str)
+        copy_parser.add_argument('--eids',
+                                help='Which exploit(s) to copy',
+                                required=True,
+                                nargs='*',
+                                type=str)
+        copy_parser.add_argument('--stage',
+                                required=False,
+                                action='store_true',
+                                help="Stage the exploit if exploit info is avaialble.")
+        copy_parser.add_argument('--cpe',
+                                required=False,
+                                default=self.read_cpe(),
+                                type=str)
+        copy_parser.add_argument('--source',
+                                required=False,
+                                default='exploit-database',
+                                type=str)
+
+        assess_parser = subparsers.add_parser('assess')
+        assess_parser.set_defaults(which='assess')
+
+    def read_config(self):
+        args = self.parser.parse_args()
+        return args
+
+    def read_cpe(self):
+        file_name = '/etc/system-release-cpe'
         try:
-            self.exploit_manager.load_exploit_info()
-        except OSError:
-            self.console_logger.error("\nNo exploit information loaded.  "
-                                      "Please try: elem refresh\n")
-            sys.exit(1)
-        self.exploitdb.refresh_exploits_with_cves()
-        lines = []
-        error_lines = []
-        cves_to_patch = ','.join(self.exploitdb.exploits[edbid]['cves'])
-
-        try:
-            self.console_logger.info("Patching system for EDB ID %s with "
-                                     "CVE(s) %s." % (edbid, cves_to_patch))
-            command = ["yum", "update", "-y", "--cve", cves_to_patch]
-            p = subprocess.Popen(command,
-                                 stdout=subprocess.PIPE,
-                                 stderr=subprocess.PIPE)
-            out, err = p.communicate()
-            self.console_logger.info("Patching Completed.  A system restart" +
-                                     "may be necessary.")
-        except OSError:
-            self.logger.error("\'assess\' may only be "
-                              "run on an Enterprise Linux host.")
-
-    def set_stage_info(self, edbid, cpe, command, packages, services, selinux):
-
-        if not command and not packages and not services and not selinux:
-            self.console_logger.error("At least one of the following must"
-                                      "be specified for staging: command, "
-                                      "packages, services, selinux")
-            sys.exit(1)
-
-        try:
-            self.exploit_manager.load_exploit_info()
-        except OSError:
-            self.console_logger.error("\nNo exploit information loaded.  "
-                                      "Please try: elem refresh\n")
-            sys.exit(1)
-
-        if command:
-            self.console_logger.info("Setting stage command for %s to %s." %
-                                     (edbid, command))
-            self.exploit_manager.set_stage_info(edbid, cpe, command)
-            self.exploit_manager.write(edbid)
-
-        if packages:
-            self.console_logger.info("Setting stage packages for %s to %s." %
-                                     (edbid, packages))
-            self.exploit_manager.add_packages(edbid, cpe, packages)
-            self.exploit_manager.write(edbid)
-
-        if services:
-            self.console_logger.info("Setting stage services for %s to %s." %
-                                     (edbid, services))
-            self.exploit_manager.add_services(edbid, cpe, services)
-            self.exploit_manager.write(edbid)
-
-        if selinux:
-            self.console_logger.info("Setting stage SELinux for %s to %s." %
-                                     (edbid, selinux))
-            self.exploit_manager.set_selinux(edbid, cpe, selinux)
-            self.exploit_manager.write(edbid)
+            with open(file_name, 'r') as cpe_file:
+                return cpe_file.read().replace('\n','')
+        except IOError:
+            return 'Not Detected'
