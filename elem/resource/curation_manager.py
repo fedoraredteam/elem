@@ -54,10 +54,7 @@ class CurationManager(object):
     def exploit_strings(self, eid):
         strings = []
         if 'cpes' not in self.data[eid].keys():
-            for cve in self.data[eid]['cves']:
                 string = eid
-                string += ","
-                string += cve
                 strings.append(string)
         else:
             for cpe in self.data[eid]['cpes'].keys():

@@ -267,7 +267,7 @@ class CliHandler(object):
         score_parser.add_argument('--kind',
                                 required=False,
                                 default='stride',
-                                choices=['stride'],
+                                choices=['stride', 'skipped'],
                                 help='Threat Score Kind',
                                 type=str)
         score_parser.add_argument('--value',
